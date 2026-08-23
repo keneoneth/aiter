@@ -1,4 +1,5 @@
 import functools
+import os
 
 
 @functools.lru_cache(maxsize=1)
@@ -23,5 +24,15 @@ def get_num_sms():
 
 
 def get_num_xcds():
+    override = os.environ.get("AITER_TRITON_NUM_XCDS")
+    if override is not None:
+        return int(override)
+    try:
+        from aiter.jit.utils.chip_info import get_gfx_runtime
+
+        if get_gfx_runtime() in ("gfx1200", "gfx1201"):
+            return 1
+    except Exception:  # noqa: BLE001
+        pass
     # Currently, you can't query this programmatically. For gfx942/gfx950 it's 8, so we hardcode that here.
     return 8

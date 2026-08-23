@@ -114,6 +114,134 @@ def _moe_prepare_unsorted_input(topk_ids, topk_weights, model_dim, moebuf_dtype)
     return topk_ids_i32, topk_weights_f32, topk_ids_i32, topk_ids_i32, moe_buf
 
 
+def _gfx1201_bf16_g1u1_triton_config(M: int, inter_dim: int) -> dict | None:
+    if inter_dim == 128:
+        if M not in (1088, 1540, 1728, 2048):
+            return None
+        if M < 1536:
+            return {
+                "BLOCK_SIZE_M": 32,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 4,
+                "num_warps": 8,
+                "num_stages": 2,
+            }
+        return {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 8,
+            "num_stages": 2,
+        }
+    if inter_dim == 256:
+        if M not in (1728, 1834, 2048):
+            return None
+        return {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 8,
+            "num_stages": 2,
+        }
+    return None
+
+
+def _triton_bf16_g1u1_moe(
+    hidden_states,
+    w1,
+    w2,
+    topk_weight,
+    topk_ids,
+    *,
+    config,
+):
+    import triton.language as tl
+
+    from aiter.ops.moe_op import moe_sum
+    from aiter.ops.triton.moe.moe_align_block_size import moe_align_block_size_triton
+    from aiter.ops.triton.moe.moe_op import fused_moe as triton_moe
+    from aiter.ops.triton.moe.moe_op_silu_fused import fused_moe_silu
+
+    M, topk = topk_ids.shape
+    E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    device = hidden_states.device
+    block_m = int(config["BLOCK_SIZE_M"])
+    max_num_tokens_padded = topk_ids.numel() + E * block_m - topk
+    max_num_m_blocks = (max_num_tokens_padded + block_m - 1) // block_m
+    sorted_token_ids = torch.empty(
+        (max_num_tokens_padded,), dtype=torch.int32, device=device
+    )
+    sorted_token_ids.fill_(topk_ids.numel())
+    sorted_expert_ids = torch.empty((max_num_m_blocks,), dtype=torch.int32, device=device)
+    num_tokens_post_padded = torch.empty((1,), dtype=torch.int32, device=device)
+    stage1 = torch.empty((M * topk, inter_dim), dtype=dtypes.bf16, device=device)
+    stage2 = torch.empty((M, topk, model_dim), dtype=dtypes.bf16, device=device)
+    out = torch.empty((M, model_dim), dtype=dtypes.bf16, device=device)
+    topk_weight = (
+        topk_weight
+        if topk_weight.dtype == dtypes.fp32 and topk_weight.is_contiguous()
+        else topk_weight.to(dtypes.fp32).contiguous()
+    )
+    topk_ids = (
+        topk_ids
+        if topk_ids.dtype == dtypes.i32 and topk_ids.is_contiguous()
+        else topk_ids.to(dtypes.i32).contiguous()
+    )
+    moe_align_block_size_triton(
+        topk_ids,
+        E,
+        block_m,
+        sorted_token_ids,
+        sorted_expert_ids,
+        num_tokens_post_padded,
+    )
+    fused_moe_silu(
+        hidden_states,
+        w1,
+        stage1,
+        None,
+        None,
+        None,
+        topk_weight,
+        topk_ids,
+        sorted_token_ids,
+        sorted_expert_ids,
+        num_tokens_post_padded,
+        False,
+        topk,
+        tl.bfloat16,
+        False,
+        False,
+        False,
+        config=config,
+    )
+    triton_moe(
+        stage1,
+        w2,
+        stage2,
+        None,
+        None,
+        None,
+        topk_weight,
+        topk_ids,
+        sorted_token_ids,
+        sorted_expert_ids,
+        num_tokens_post_padded,
+        True,
+        1,
+        tl.bfloat16,
+        False,
+        False,
+        False,
+        config=config,
+    )
+    moe_sum(stage2, out)
+    return out
+
+
 def _adaptive_moe_sort(
     topk_ids,
     topk_weights,
@@ -982,6 +1110,42 @@ def _fused_moe_impl(
             dtype=dtype,
         )
 
+    triton_config = _gfx1201_bf16_g1u1_triton_config(M, inter_dim)
+    if (
+        triton_config is not None
+        and get_gfx_runtime() == "gfx1201"
+        and quant_type == QuantType.No
+        and isG1U1
+        and activation == ActivationType.Silu
+        and dtype == dtypes.bf16
+        and hidden_states.dtype == dtypes.bf16
+        and w1.dtype == dtypes.bf16
+        and w2.dtype == dtypes.bf16
+        and topk == 8
+        and E == 256
+        and model_dim == 2048
+        and expert_mask is None
+        and bias1 is None
+        and bias2 is None
+        and w1_scale is None
+        and w2_scale is None
+        and a1_scale is None
+        and a2_scale is None
+        and num_local_tokens is None
+        and hidden_pad == 0
+        and intermediate_pad == 0
+        and not doweight_stage1
+        and gate_mode == GateMode.SEPARATED
+    ):
+        return _triton_bf16_g1u1_moe(
+            hidden_states.contiguous(),
+            w1.contiguous(),
+            w2.contiguous(),
+            topk_weight,
+            topk_ids,
+            config=triton_config,
+        )
+
     # a16w4-SiTUv2 (bf16 A x MXFP4 W); SiTUv2 gate distinguishes gpt-oss (Swiglu -> cktile).
     _is_a16w4_situv2 = (
         quant_type == QuantType.per_1x32
@@ -1011,7 +1175,7 @@ def _fused_moe_impl(
                 )
 
     metadata = get_2stage_cfgs(
-        get_padded_M(M),  # consider token_num > 1024 as prefill
+        M,
         model_dim,
         inter_dim,
         E,
@@ -2375,25 +2539,56 @@ def get_2stage_cfgs(
         )
         logger.info("\033[0m")
 
+    def _lookup_from(table, lookup_keys):
+        result = table.get(lookup_keys, None)
+        if result is not None:
+            return result
+        # Some RDNA parts report CU count differently across environments.
+        # If the exact CU key misses, prefer the nearest row for the same gfx.
+        matches = [
+            (abs(int(candidate_keys[1]) - cu_num), candidate_keys[1], cfg)
+            for candidate_keys, cfg in table.items()
+            if candidate_keys[0] == gfx and candidate_keys[2:] == lookup_keys[2:]
+        ]
+        if not matches:
+            return None
+        matches.sort(key=lambda item: (item[0], item[1]))
+        return matches[0][2]
+
     def _lookup_cfg(c2s):
         if not c2s:
             return None
         primary, fallback = c2s
-        result = primary.get(keys, None)
+        result = _lookup_from(primary, keys)
         if result is None:
-            result = fallback.get(keys_disabled, None)
+            result = _lookup_from(fallback, keys_disabled)
+        if result is None:
+            padded_token = get_padded_M(token)
+            if padded_token != token:
+                keys_padded = keys[:2] + (padded_token,) + keys[3:]
+                keys_padded_disabled = (
+                    keys_disabled[:2] + (padded_token,) + keys_disabled[3:]
+                )
+                result = _lookup_from(primary, keys_padded)
+                if result is None:
+                    result = _lookup_from(fallback, keys_padded_disabled)
         # Tier fallback: if current tier not found, try smaller tiers in descending order
-        if result is None and token > _PADDED_M_TIERS[0]:
-            tier_idx = _PADDED_M_TIERS.index(token) if token in _PADDED_M_TIERS else -1
+        lookup_token = get_padded_M(token)
+        if result is None and lookup_token > _PADDED_M_TIERS[0]:
+            tier_idx = (
+                _PADDED_M_TIERS.index(lookup_token)
+                if lookup_token in _PADDED_M_TIERS
+                else -1
+            )
             for fallback_tier in reversed(_PADDED_M_TIERS[:tier_idx]):
                 # keys layout: (gfx, cu_num, token, ...); replace token (idx 2).
                 keys_fb = keys[:2] + (fallback_tier,) + keys[3:]
                 keys_fb_disabled = (
                     keys_disabled[:2] + (fallback_tier,) + keys_disabled[3:]
                 )
-                result = primary.get(keys_fb, None)
+                result = _lookup_from(primary, keys_fb)
                 if result is None:
-                    result = fallback.get(keys_fb_disabled, None)
+                    result = _lookup_from(fallback, keys_fb_disabled)
                 if result is not None:
                     break
         return result
@@ -3103,7 +3298,7 @@ def fused_moe_2stages(
         moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
     is_shuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
     metadata = get_2stage_cfgs(
-        get_padded_M(token_num),  # consider token_num > 1024 as prefill
+        token_num,
         model_dim,
         inter_dim,
         E,
