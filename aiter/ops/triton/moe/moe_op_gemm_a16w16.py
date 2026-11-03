@@ -20,8 +20,6 @@ def build_routing_from_topk(
     num_experts: int,
     block_m: int = 32,
 ):
-    if bool(torch.any(topk_ids < 0).item()) or bool(torch.any(topk_ids >= num_experts).item()):
-        raise ValueError("moe_gemm_a16w16 requires valid topk ids")
     return align_topk_ids(
         topk_ids, topk_weights, num_experts=num_experts, block_m=block_m
     )
