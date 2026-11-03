@@ -137,13 +137,15 @@ def fused_moe_bf16_g1u1(
     *,
     output: torch.Tensor | None = None,
 ):
+    assert w1.is_contiguous()
+    assert w2.is_contiguous()
     experts = w1.shape[0]
     routing_data, gather_indx, scatter_indx, sorted_weights = build_routing_from_topk(
         topk_ids, topk_weight, num_experts=experts, block_m=32
     )
     stage1 = moe_gemm_a16w16(
         hidden_states.contiguous(),
-        w1.contiguous(),
+        w1,
         routing_data=routing_data,
         gather_indx=gather_indx,
         apply_separated_silu=True,
@@ -151,7 +153,7 @@ def fused_moe_bf16_g1u1(
     )
     return moe_gemm_a16w16(
         stage1.contiguous(),
-        w2.contiguous(),
+        w2,
         routing_data=routing_data,
         scatter_indx=scatter_indx,
         gammas=sorted_weights,
